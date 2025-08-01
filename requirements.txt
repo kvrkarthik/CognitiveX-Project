@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+streamlit
+pydantic
+transformers
+torch
+requests
+ibm-watson
+scikit-learn

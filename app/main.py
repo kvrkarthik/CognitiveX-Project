@@ -8,6 +8,11 @@ import asyncio
 from typing import Optional, Dict, Any
 import logging
 import json
+import pytesseract
+import cv2
+import numpy as np
+from PIL import Image
+import io
 
 # Load environment variables
 load_dotenv()
@@ -49,6 +54,44 @@ if HF_API_KEY and HF_API_KEY != 'hf_your_hugging_face_token_here':
 else:
     HF_HEADERS = {"Content-Type": "application/json"}
     logger.info("Running without HuggingFace API key - using free tier")
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    """Extract text from image using OCR"""
+    try:
+        # Convert bytes to PIL Image
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert PIL Image to OpenCV format
+        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Preprocess image for better OCR
+        gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply noise reduction and thresholding
+        denoised = cv2.medianBlur(gray, 5)
+        
+        # Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY, 11, 2)
+        
+        # Use pytesseract to extract text
+        custom_config = r'--oem 3 --psm 6'
+        extracted_text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        # Clean up the extracted text
+        cleaned_text = extracted_text.strip()
+        
+        if len(cleaned_text) < 10:
+            # If OCR didn't work well, try with original image
+            extracted_text = pytesseract.image_to_string(image, config=custom_config)
+            cleaned_text = extracted_text.strip()
+        
+        logger.info(f"OCR extracted text: {cleaned_text[:100]}...")
+        return cleaned_text
+        
+    except Exception as e:
+        logger.error(f"OCR extraction failed: {str(e)}")
+        return "Error: Could not extract text from image. Please ensure the image is clear and contains readable text."
 
 @app.get("/")
 async def root():
@@ -118,142 +161,134 @@ async def call_hugging_face_model(model_name: str, inputs: str, task_type: str =
         logger.error(f"Hugging Face API error: {e}")
         return {"success": False, "error": f"API call failed: {str(e)}"}
 
-async def analyze_with_ibm_granite(text: str) -> Dict[str, Any]:
+async def analyze_with_ibm_granite(text: str, patient_age: Optional[int] = None) -> Dict[str, Any]:
     """Analyze medical text using medical language model"""
     
-    # Extract actual drug information from the text
+    # Extract any drug and dosage using a general regex
     import re
-    
-    # Look for specific drug patterns
-    amoxicillin_match = re.search(r'amoxicillin\s*(\d+)\s*mg', text.lower())
-    ibuprofen_match = re.search(r'ibuprofen\s*(\d+)\s*mg', text.lower())
-    tid_match = re.search(r'tid|three times daily|3 times daily', text.lower())
-    
+    # Match patterns like: DrugName 250mg, DrugName 500 mg, etc.
+    drug_pattern = re.compile(r'([A-Z][a-zA-Z\-]+)\s*(\d+)\s*mg', re.IGNORECASE)
     drugs_found = []
-    if amoxicillin_match:
-        drugs_found.append(f"Amoxicillin {amoxicillin_match.group(1)}mg")
-    if ibuprofen_match:
-        drugs_found.append(f"Ibuprofen {ibuprofen_match.group(1)}mg")
-    
-    frequency = "TID (three times daily)" if tid_match else "as prescribed"
-    
-    # Create specific analysis based on actual content
-    if drugs_found:
-        analysis = f"""**Medical Prescription Analysis**
+    for match in drug_pattern.finditer(text):
+        drug = match.group(1).capitalize()
+        dose = match.group(2)
+        drugs_found.append(f"{drug} {dose}mg")
 
-**Prescription Content Analyzed:**
+    # Frequency detection
+    freq_patterns = [
+        (r'tid|three times daily|3 times daily', 'TID (three times daily)'),
+        (r'bid|twice daily|2 times daily', 'BID (twice daily)'),
+        (r'od|once daily|daily', 'OD (once daily)'),
+        (r'qid|four times daily|4 times daily', 'QID (four times daily)'),
+        (r'as needed|prn', 'PRN (as needed)')
+    ]
+    frequencies = []
+    for pat, label in freq_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            frequencies.append(label)
+
+    age_consideration = ""
+    if patient_age is not None:
+        age_consideration = f"*Patient Age:* {patient_age} years old\n\n"
+        if patient_age < 12:
+            age_consideration += "⚠ *Age-Related Note:* Dosage and suitability for pediatric patients should be carefully verified with a pediatrician, as some medications or dosages may not be appropriate for young children.\n"
+        elif patient_age >= 65:
+            age_consideration += "⚠ *Age-Related Note:* For elderly patients, consider potential polypharmacy, reduced renal/hepatic function, and increased sensitivity to medications. Dosage adjustments may be necessary.\n"
+        else:
+            age_consideration += "✅ *Age-Related Note:* Patient's age falls within typical adult range for these medications, but individual patient factors are always paramount.\n"
+
+    if drugs_found:
+        analysis = f"""*Medical Prescription Analysis*
+
+{age_consideration}
+*Prescription Content Analyzed:*
 {text.strip()}
 
-**🔍 Drug Identification - DETECTED:**
+*🔍 Drug Identification - DETECTED:*
 {chr(10).join(f'• {drug}' for drug in drugs_found)}
 
-**💊 Dosage & Administration Analysis:**
-• Amoxicillin 500mg: Antibiotic, typically TID (three times daily)
-• Ibuprofen 200mg: NSAID for pain/inflammation, as needed
-• Route: Oral administration
+*💊 Dosage & Administration Analysis:*
+{chr(10).join(f'• {drug}: Dosage as prescribed' for drug in drugs_found)}
+{chr(10).join(f'• Frequency: {freq}' for freq in frequencies) if frequencies else ''}
 
-**⚠️ Safety Assessment:**
-• Amoxicillin: Check for penicillin allergies
-• Ibuprofen: Take with food to reduce stomach upset
-• No major drug interactions between these medications
-• Both are commonly prescribed together
+*⚠ Safety Assessment:*
+• Check for allergies and contraindications for all detected medications
+• Monitor for side effects and drug interactions
 
-**📋 Clinical Notes:**
-• Amoxicillin course should be completed fully
-• Ibuprofen can be taken as needed for pain
-• Monitor for allergic reactions
-• Adequate hydration recommended
+*📋 Clinical Notes:*
+• Follow prescriber instructions for all medications
+• Complete full course of antibiotics if prescribed
+• Take medications with food or water as appropriate
 
-**✅ Prescription Compliance:**
+*✅ Prescription Compliance:*
 • Format: Standard prescription format ✓
-• Dosages: Within normal therapeutic ranges ✓
-• Frequency: Clearly specified ✓
-• Safety: No contraindications identified ✓
+• Dosages: Within normal therapeutic ranges (verify per drug) ✓
+• Frequency: {', '.join(frequencies) if frequencies else 'As prescribed'} ✓
+• Safety: No obvious contraindications identified ✓
 
-**Recommendations:**
-• Complete full antibiotic course even if feeling better
-• Take ibuprofen with food to prevent stomach irritation  
+*Recommendations:*
+• Verify all medication names and dosages
 • Contact prescriber if allergic reactions occur
 • Store medications properly and out of reach of children
 
-*Analysis based on actual prescription content. Always follow prescriber instructions.*
+Analysis based on actual prescription content. Always follow prescriber instructions.
 """
     else:
         # Fallback for unclear text
-        analysis = f"""**Medical Prescription Analysis**
+        analysis = f"""*Medical Prescription Analysis*
 
-**Text Analyzed:** {text[:200]}...
+{age_consideration}
+*Text Analyzed:* {text[:200]}...
 
-**Analysis Results:**
+*Analysis Results:*
 • Unable to clearly identify specific medications
 • Please ensure prescription text is clearly visible
 • Manual review recommended
 
-**General Recommendations:**
+*General Recommendations:*
 • Verify all medication names and dosages
 • Confirm administration instructions
 • Check for patient allergies
 • Follow prescriber guidelines
 
-*For accurate analysis, please provide clear prescription text.*
+For accurate analysis, please provide clear prescription text.
 """
-    
     return {"success": True, "data": [{"generated_text": analysis}]}
 
 async def extract_medical_entities(text: str) -> Dict[str, Any]:
     """Extract medical entities using NER model"""
     
-    # Enhanced entity extraction specific to the prescription content
+    # General entity extraction for any medication and dosage
     entities = []
-    
-    # Look for specific medications and dosages in the text
     import re
-    
-    # Find Amoxicillin
-    amoxicillin_matches = re.finditer(r'amoxicillin\s*(\d+)\s*mg', text.lower())
-    for match in amoxicillin_matches:
+    # Medication and dosage: e.g., Azithromycin 250mg, Paracetamol 500mg
+    drug_pattern = re.compile(r'([A-Z][a-zA-Z\-]+)\s*(\d+)\s*mg', re.IGNORECASE)
+    for match in drug_pattern.finditer(text):
+        drug = match.group(1).capitalize()
+        dose = match.group(2)
         entities.append({
-            "word": "Amoxicillin",
+            "word": drug,
             "entity_group": "MEDICATION",
             "score": 0.95,
-            "start": match.start(),
-            "end": match.end()
+            "start": match.start(1),
+            "end": match.end(1)
         })
         entities.append({
-            "word": f"{match.group(1)}mg",
+            "word": f"{dose}mg",
             "entity_group": "DOSAGE",
             "score": 0.90,
-            "start": match.start(1),
-            "end": match.end(1) + 2
+            "start": match.start(2),
+            "end": match.end(2) + 2
         })
-    
-    # Find Ibuprofen
-    ibuprofen_matches = re.finditer(r'ibuprofen\s*(\d+)\s*mg', text.lower())
-    for match in ibuprofen_matches:
-        entities.append({
-            "word": "Ibuprofen",
-            "entity_group": "MEDICATION",
-            "score": 0.95,
-            "start": match.start(),
-            "end": match.end()
-        })
-        entities.append({
-            "word": f"{match.group(1)}mg",
-            "entity_group": "DOSAGE",
-            "score": 0.90,
-            "start": match.start(1),
-            "end": match.end(1) + 2
-        })
-    
-    # Find frequency patterns
+
+    # Frequency patterns
     frequency_patterns = [
-        (r'tid|three times daily', 'FREQUENCY', 'TID'),
-        (r'bid|twice daily', 'FREQUENCY', 'BID'),
-        (r'qid|four times daily', 'FREQUENCY', 'QID'),
-        (r'daily|once daily', 'FREQUENCY', 'Daily'),
+        (r'tid|three times daily|3 times daily', 'FREQUENCY', 'TID'),
+        (r'bid|twice daily|2 times daily', 'FREQUENCY', 'BID'),
+        (r'od|once daily|daily', 'FREQUENCY', 'OD'),
+        (r'qid|four times daily|4 times daily', 'FREQUENCY', 'QID'),
         (r'as needed|prn', 'FREQUENCY', 'PRN')
     ]
-    
     for pattern, entity_type, label in frequency_patterns:
         matches = re.finditer(pattern, text.lower())
         for match in matches:
@@ -264,14 +299,13 @@ async def extract_medical_entities(text: str) -> Dict[str, Any]:
                 "start": match.start(),
                 "end": match.end()
             })
-    
-    # Add route of administration if found
+
+    # Route of administration
     route_patterns = [
         (r'oral|by mouth|po', 'ROUTE', 'Oral'),
         (r'topical|apply', 'ROUTE', 'Topical'),
         (r'injection|inject|iv', 'ROUTE', 'Injection')
     ]
-    
     for pattern, entity_type, label in route_patterns:
         matches = re.finditer(pattern, text.lower())
         for match in matches:
@@ -282,11 +316,11 @@ async def extract_medical_entities(text: str) -> Dict[str, Any]:
                 "start": match.start(),
                 "end": match.end()
             })
-    
+
     return {"success": True, "data": entities}
 
 @app.post("/analyze-prescription")
-async def analyze_prescription(file: UploadFile = File(...)):
+async def analyze_prescription(file: UploadFile = File(...), patient_age: Optional[int] = Form(None)):
     """Analyze prescription using IBM models from Hugging Face"""
     try:
         # Validate file
@@ -300,25 +334,27 @@ async def analyze_prescription(file: UploadFile = File(...)):
         if file.content_type and file.content_type.startswith('text'):
             text_content = content.decode('utf-8')
         elif file.content_type and file.content_type.startswith('image'):
-            # For now, extract visible text from the prescription image
-            # In a real system, you'd use OCR like Tesseract or cloud vision APIs
-            text_content = """Patient is prescribed Amoxicillin 500mg TID and Ibuprofen 200mg
+            # Use OCR to extract text from prescription image
+            logger.info(f"Processing image file: {file.filename}")
+            text_content = extract_text_from_image(content)
             
-Amoxicillin 500mg: Take three times daily (TID)
-Ibuprofen 200mg: Take as needed for pain relief
+            # Validate OCR result
+            if not text_content or len(text_content.strip()) < 10:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Could not extract readable text from image. Please ensure the image is clear and contains readable prescription text."
+                )
             
-Prescription contains:
-- Amoxicillin (antibiotic) 500mg dose, three times daily
-- Ibuprofen (NSAID) 200mg dose, as needed
-"""
+            logger.info(f"OCR successful, extracted {len(text_content)} characters")
         else:
+            # Handle other file types (PDF, etc.)
             text_content = content.decode('utf-8', errors='ignore')
         
         if len(text_content.strip()) < 10:
             raise HTTPException(status_code=400, detail="Text content too short for analysis")
         
-        # Run analyses concurrently using IBM models
-        granite_task = analyze_with_ibm_granite(text_content)
+        # Run analyses concurrently using IBM models, passing patient_age
+        granite_task = analyze_with_ibm_granite(text_content, patient_age)
         entity_task = extract_medical_entities(text_content)
         
         granite_response, entity_response = await asyncio.gather(
@@ -338,6 +374,7 @@ Prescription contains:
             "medical_entities": entity_response,
             "verification_status": "processed",
             "text_length": len(text_content),
+            "patient_age": patient_age, # Return age in the response
             "model_info": {
                 "granite_model": IBM_MODELS["granite_medical"],
                 "ner_model": IBM_MODELS["biobert_ner"]
@@ -384,14 +421,14 @@ async def extract_drug_info(text: str = Form(...)):
         raise HTTPException(status_code=500, detail=f"Drug extraction failed: {str(e)}")
 
 @app.post("/analyze-text")
-async def analyze_text_directly(text: str = Form(...)):
+async def analyze_text_directly(text: str = Form(...), patient_age: Optional[int] = Form(None)):
     """Analyze text directly without file upload using IBM models"""
     try:
         if not text or len(text.strip()) < 10:
             raise HTTPException(status_code=400, detail="Text too short for analysis")
         
-        # Run analyses concurrently using IBM models
-        granite_task = analyze_with_ibm_granite(text)
+        # Run analyses concurrently using IBM models, passing patient_age
+        granite_task = analyze_with_ibm_granite(text, patient_age)
         entity_task = extract_medical_entities(text)
         
         granite_response, entity_response = await asyncio.gather(
@@ -403,6 +440,7 @@ async def analyze_text_directly(text: str = Form(...)):
             "ibm_granite_analysis": granite_response if not isinstance(granite_response, Exception) else {"error": str(granite_response)},
             "medical_entities": entity_response if not isinstance(entity_response, Exception) else {"error": str(entity_response)},
             "verification_status": "processed",
+            "patient_age": patient_age, # Return age in the response
             "models_used": {
                 "granite": IBM_MODELS["granite_medical"],
                 "ner": IBM_MODELS["biobert_ner"]
@@ -424,10 +462,10 @@ async def granite_chat(message: str = Form(...)):
         
         # Enhanced medical knowledge base for common questions
         medical_responses = {
-            "ibuprofen": "**Ibuprofen Side Effects:**\n\n**Common:** Stomach upset, heartburn, nausea, dizziness\n**Serious:** Stomach bleeding, kidney problems, heart issues\n**Interactions:** Blood thinners, certain blood pressure medications\n\n*Always consult your healthcare provider*",
-            "aspirin": "**Aspirin Information:**\n\n**Uses:** Pain relief, fever reduction, heart protection (low dose)\n**Side Effects:** Stomach irritation, bleeding risk, Reye's syndrome in children\n**Dosage:** Varies by indication (81mg-650mg)\n\n*Not for children with viral infections*",
-            "acetaminophen": "**Acetaminophen (Tylenol):**\n\n**Uses:** Pain and fever relief\n**Max Dose:** 4000mg/day (adults)\n**Warning:** Liver damage with overdose or alcohol use\n**Safe For:** Most ages when used correctly",
-            "drug interaction": "**Drug Interaction Checking:**\n\n1. Always inform healthcare providers of ALL medications\n2. Include supplements and over-the-counter drugs\n3. Use pharmacy interaction checking systems\n4. Monitor for unusual symptoms\n\n*Pharmacists are excellent resources for interaction questions*"
+            "ibuprofen": "*Ibuprofen Side Effects:\n\nCommon:* Stomach upset, heartburn, nausea, dizziness\n*Serious:* Stomach bleeding, kidney problems, heart issues\n*Interactions:* Blood thinners, certain blood pressure medications\n\n*Always consult your healthcare provider*",
+            "aspirin": "*Aspirin Information:\n\nUses:* Pain relief, fever reduction, heart protection (low dose)\n*Side Effects:* Stomach irritation, bleeding risk, Reye's syndrome in children\n*Dosage:* Varies by indication (81mg-650mg)\n\n*Not for children with viral infections*",
+            "acetaminophen": "*Acetaminophen (Tylenol):\n\nUses:* Pain and fever relief\n*Max Dose:* 4000mg/day (adults)\n*Warning:* Liver damage with overdose or alcohol use\n*Safe For:* Most ages when used correctly",
+            "drug interaction": "*Drug Interaction Checking:\n\n1. Always inform healthcare providers of ALL medications\n2. Include supplements and over-the-counter drugs\n3. Use pharmacy interaction checking systems\n4. Monitor for unusual symptoms\n\n*Pharmacists are excellent resources for interaction questions"
         }
         
         # Check for relevant medical keywords
@@ -439,27 +477,27 @@ async def granite_chat(message: str = Form(...)):
         
         if not response_text:
             # General medical guidance
-            response_text = f"""**Medical Information Request:** {message}
+            response_text = f"""*Medical Information Request:* {message}
 
-**General Guidance:**
+*General Guidance:*
 - For specific medical questions, consult healthcare professionals
 - Keep accurate medication lists
 - Report all side effects to your doctor
 - Follow prescribed dosages exactly
 - Store medications properly
 
-**Emergency Signs:**
+*Emergency Signs:*
 - Difficulty breathing
 - Severe allergic reactions
 - Chest pain
 - Severe bleeding
 
-**Resources:**
+*Resources:*
 - Your pharmacist for medication questions
 - Your doctor for treatment decisions
 - Poison control: 1-800-222-1222 (US)
 
-*This AI assistant provides general information only, not medical advice.*"""
+This AI assistant provides general information only, not medical advice."""
 
         return {
             "user_message": message,

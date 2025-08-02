@@ -6,3 +6,7 @@ requests==2.31.0
 transformers==4.38.2
 torch==2.2.1
 tokenizers==0.15.2
+streamlit==1.47.1
+pillow>=10.0.0
+pytesseract==0.3.13
+opencv-python-headless==4.10.0.84
